@@ -1,3 +1,22 @@
+"""
+=============================================================================
+MACHINE LEARNING PROJECT: VULNERABILITY RISK SCORING (CVE/KEV)
+=============================================================================
+Student Name: [Your Name]
+Date: December 2025
+
+OBJECTIVE:
+Predict whether a CVE (Common Vulnerabilities and Exposures) is likely to be 
+exploited (KEV - Known Exploited Vulnerability) based on its description 
+and metrics.
+
+MODE: 
+FULL WEB FETCH (No local cache reading) to ensure data integrity.
+"""
+
+# =============================================================================
+# 1. IMPORTATION OF LIBRARIES AND DATASET
+# =============================================================================
 import pandas as pd
 import numpy as np
 import requests
@@ -7,37 +26,41 @@ import io
 import re
 import warnings
 import os
+import matplotlib.pyplot as plt
+import seaborn as sns
 from datetime import datetime, timezone
 from tqdm import tqdm
 from pathlib import Path
 
-# --- Imports Machine Learning ---
+# Scikit-Learn Ecosystem
 from sklearn.compose import ColumnTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics import roc_auc_score, classification_report, average_precision_score
+from sklearn.metrics import (roc_auc_score, classification_report, 
+                             average_precision_score, confusion_matrix, 
+                             f1_score)
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.decomposition import PCA
 from sklearn.impute import SimpleImputer
+from sklearn.model_selection import train_test_split
 
-# Gestion LightGBM
+# Try importing LightGBM (Advanced Model)
 try:
     from lightgbm import LGBMClassifier
     HAS_LIGHTGBM = True
 except ImportError:
     HAS_LIGHTGBM = False
-    print("Info : LightGBM non détecté. Le script basculera sur RandomForest.")
+    print("Info: LightGBM not found. Skipping advanced gradient boosting models.")
 
 warnings.filterwarnings('ignore')
 
-# ---------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------
+# --- CONFIGURATION ---
 START_YEAR = 2002
 END_YEAR = datetime.now().year
 NVD_FEED_URL = "https://nvd.nist.gov/feeds/json/cve/2.0/nvdcve-2.0-{}.json.zip"
 CISA_KEV_URL = "https://www.cisa.gov/sites/default/files/csv/known_exploited_vulnerabilities.csv"
-
 ML_TARGET_COL = "is_kev"
 ML_DATE_COL = "published_date"
 ML_TEST_SIZE = 0.2
@@ -55,286 +78,379 @@ KEYWORD_PATTERNS = {
 
 CVSS_METRICS_KEYS = ["AV", "AC", "PR", "UI", "S", "C", "I", "A"]
 
-# ---------------------------------------------------------
-# 1. Gestion des données (ETL)
-# ---------------------------------------------------------
-
+# --- DATA LOADING FUNCTIONS ---
 def parse_cvss_vector(vector_str):
     out = {m: "MISSING" for m in CVSS_METRICS_KEYS}
-    if not isinstance(vector_str, str):
-        return out
+    if not isinstance(vector_str, str): return out
     parts = vector_str.split('/')
     for part in parts:
         if ':' in part:
             key, val = part.split(':', 1)
-            if key in out:
-                out[key] = val
+            if key in out: out[key] = val
     return out
 
-def try_load_local_files():
-    """Charge les CSV locaux s'ils existent."""
-    print("Vérification des fichiers locaux...")
-    files_csv = ('dataset_patched.csv', 'dataset_unpatched.csv')
+def load_data_from_web_only():
+    """
+    FORCE DOWNLOAD MODE:
+    Ignores local CSV files to prevent data corruption. 
+    Always fetches fresh data from NVD and CISA.
+    """
+    print("\n[ETL] STARTING DATA EXTRACTION (WEB ONLY)...")
     
-    if os.path.exists(files_csv[0]) and os.path.exists(files_csv[1]):
+    # 1. Download Target Labels (CISA KEV)
+    print(" -> Fetching CISA Known Exploited Vulnerabilities...")
+    kev_set = set()
+    try:
+        kev_df = pd.read_csv(CISA_KEV_URL)
+        kev_set = set(kev_df['cveID'].unique())
+        print(f"    * CISA KEV Loaded: {len(kev_set)} entries.")
+    except Exception as e:
+        print(f"    ! Error fetching CISA KEV: {e}")
+
+    # 2. Download Features (NVD Feeds)
+    print(f" -> Fetching NVD Feeds ({START_YEAR}-{END_YEAR})...")
+    all_data = []
+    
+    for year in tqdm(range(START_YEAR, END_YEAR + 1)):
         try:
-            df_patched = pd.read_csv(files_csv[0])
-            df_unpatched = pd.read_csv(files_csv[1])
-            
-            df_patched[ML_TARGET_COL] = 1
-            df_unpatched[ML_TARGET_COL] = 0
-            
-            df_full = pd.concat([df_patched, df_unpatched], ignore_index=True)
-            print(f" -> Chargement local réussi : {len(df_full)} entrées.")
-            return df_full
+            r = requests.get(NVD_FEED_URL.format(year), timeout=60)
+            if r.status_code == 200:
+                with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+                    # NVD JSON parsing
+                    json_filename = z.namelist()[0]
+                    data = json.loads(z.read(json_filename))
+                    
+                    for item in data.get('vulnerabilities', []):
+                        cve = item.get('cve', {})
+                        metrics = cve.get('metrics', {})
+                        
+                        # Prioritize V3.1 > V3.0 > V2
+                        score, vector = np.nan, None
+                        if 'cvssMetricV31' in metrics:
+                            d = metrics['cvssMetricV31'][0]['cvssData']
+                            score, vector = d.get('baseScore'), d.get('vectorString')
+                        elif 'cvssMetricV30' in metrics:
+                            d = metrics['cvssMetricV30'][0]['cvssData']
+                            score, vector = d.get('baseScore'), d.get('vectorString')
+                        elif 'cvssMetricV2' in metrics:
+                            d = metrics['cvssMetricV2'][0]['cvssData']
+                            score, vector = d.get('baseScore'), d.get('vectorString')
+                        
+                        # Extract description (English)
+                        desc = next((d['value'] for d in cve.get('descriptions', []) if d['lang'] == 'en'), "")
+                        
+                        # Check for 'Patch' tag in references
+                        has_patch = 0
+                        for ref in cve.get('references', []):
+                            if 'tags' in ref and 'Patch' in ref['tags']:
+                                has_patch = 1; break
+                        
+                        all_data.append({
+                            'cve_id': cve.get('id'),
+                            'published_date': cve.get('published'),
+                            'description': desc,
+                            'cvss_score': score,
+                            'cvss_vector': vector,
+                            'has_patch_ref': has_patch
+                        })
         except Exception as e:
-            print(f" -> Erreur lecture CSV: {e}")
-    
-    print(" -> Fichiers locaux absents ou incomplets. Passage au téléchargement.")
-    return None
+            print(f"    ! Error processing year {year}: {e}")
 
-def process_year_data(year):
-    """Téléchargement NVD."""
-    url = NVD_FEED_URL.format(year)
-    year_cves = []
+    if not all_data:
+        raise ValueError("CRITICAL: No data could be downloaded from NVD.")
+
+    df = pd.DataFrame(all_data)
     
+    # Labeling
+    df[ML_TARGET_COL] = df['cve_id'].apply(lambda x: 1 if x in kev_set else 0)
+    
+    # Save a backup (just in case, but we won't read it next time)
+    print(" -> Data extraction complete. Saving backup CSVs...")
     try:
-        response = requests.get(url, timeout=60)
-        if response.status_code != 200:
-            return []
-        
-        with zipfile.ZipFile(io.BytesIO(response.content)) as z:
-            json_filename = z.namelist()[0]
-            with z.open(json_filename) as f:
-                data = json.load(f)
-                
-        for item in data.get('vulnerabilities', []):
-            cve = item.get('cve', {})
-            cve_id = cve.get('id')
-            
-            desc_text = ""
-            for d in cve.get('descriptions', []):
-                if d['lang'] == 'en':
-                    desc_text = d['value']
-                    break
-            
-            published = cve.get('published')
-            
-            score = np.nan
-            vector = None
-            metrics = cve.get('metrics', {})
-            
-            if 'cvssMetricV31' in metrics:
-                data = metrics['cvssMetricV31'][0]['cvssData']
-                score, vector = data.get('baseScore'), data.get('vectorString')
-            elif 'cvssMetricV30' in metrics:
-                data = metrics['cvssMetricV30'][0]['cvssData']
-                score, vector = data.get('baseScore'), data.get('vectorString')
-            elif 'cvssMetricV2' in metrics:
-                data = metrics['cvssMetricV2'][0]['cvssData']
-                score, vector = data.get('baseScore'), data.get('vectorString') 
-
-            has_patch_ref = 0
-            for ref in cve.get('references', []):
-                tags = ref.get('tags', [])
-                if tags and 'Patch' in tags:
-                    has_patch_ref = 1
-                    break
-
-            year_cves.append({
-                'cve_id': cve_id,
-                'published_date': published,
-                'description': desc_text,
-                'cvss_score': score,
-                'cvss_vector': vector,
-                'has_patch_ref': has_patch_ref
-            })
-
-    except Exception as e:
-        print(f"Erreur NVD année {year}: {e}")
-        
-    return year_cves
-
-def get_cisa_kev_data():
-    print("Tentative de téléchargement CISA KEV...")
-    try:
-        df = pd.read_csv(CISA_KEV_URL)
-        return set(df['cveID'].unique())
-    except Exception as e:
-        print(f"Erreur CISA Web ({e}).")
-        return set()
-
-def build_dataset():
-    # 1. Essai Local
-    df = try_load_local_files()
-    
-    # 2. Essai Web
-    if df is None:
-        print(f"Démarrage téléchargement NVD ({START_YEAR}-{END_YEAR})")
-        all_data = []
-        for year in tqdm(range(START_YEAR, END_YEAR + 1)):
-            all_data.extend(process_year_data(year))
-        
-        df = pd.DataFrame(all_data)
-        if df.empty:
-            raise ValueError("Impossible de récupérer des données.")
-            
-        kev_set = get_cisa_kev_data()
-        df[ML_TARGET_COL] = df['cve_id'].apply(lambda x: 1 if x in kev_set else 0)
-        
-        print("Sauvegarde des données...")
         df[df[ML_TARGET_COL] == 1].to_csv('dataset_patched.csv', index=False)
         df[df[ML_TARGET_COL] == 0].to_csv('dataset_unpatched.csv', index=False)
+    except:
+        pass
     
-    # 3. Nettoyage
-    df[ML_DATE_COL] = pd.to_datetime(df[ML_DATE_COL], errors='coerce', utc=True)
-    df = df.dropna(subset=[ML_DATE_COL]).sort_values(ML_DATE_COL).reset_index(drop=True)
-    
-    if 'published' in df.columns and 'published_date' not in df.columns:
-        df.rename(columns={'published': 'published_date'}, inplace=True)
-    if 'shortDescription' in df.columns and 'description' not in df.columns:
-        df.rename(columns={'shortDescription': 'description'}, inplace=True)
-        
-    print(f"Dataset prêt : {df.shape} | Exploités (KEV) : {df[ML_TARGET_COL].sum()}")
     return df
 
-# ---------------------------------------------------------
-# 2. Feature Engineering
-# ---------------------------------------------------------
-
-def feature_engineering(df):
-    df = df.copy()
-    print("Génération des features...")
-
-    desc = df['description'].fillna("").astype(str)
+# =============================================================================
+# 2. DATASET ANALYSIS (Quality, Visu, Correlation)
+# =============================================================================
+def analyze_dataset(df):
+    print("\n" + "="*50)
+    print("STEP 2: DATASET ANALYSIS")
+    print("="*50)
     
+    # 2.1 Basic Stats
+    print(f"Dimensions: {df.shape}")
+    print(f"Columns: {df.columns.tolist()}")
+    
+    # 2.2 Data Balance
+    counts = df[ML_TARGET_COL].value_counts()
+    print(f"\nTarget Distribution ({ML_TARGET_COL}):\n{counts}")
+    ratio = counts[1] / (counts[0] + counts[1]) * 100
+    print(f"Positive Class Ratio: {ratio:.2f}% (High Imbalance!)")
+    
+    # 2.3 Visualization
+    try:
+        plt.figure(figsize=(6, 4))
+        sns.countplot(x=ML_TARGET_COL, data=df, palette='viridis')
+        plt.title('Target Distribution (0=Safe, 1=Exploited)')
+        plt.yscale('log')
+        plt.ylabel('Count (Log Scale)')
+        plt.show()
+    except Exception:
+        pass
+
+# =============================================================================
+# 3. DATA PRE-PROCESSING
+# =============================================================================
+def preprocess_data(df):
+    print("\n" + "="*50)
+    print("STEP 3: DATA PRE-PROCESSING")
+    print("="*50)
+    
+    df = df.copy()
+    
+    # 3.1 Cleaning
+    init_len = len(df)
+    df = df.drop_duplicates(subset=['cve_id'])
+    
+    # Handle Dates (Crucial Step)
+    df[ML_DATE_COL] = pd.to_datetime(df[ML_DATE_COL], errors='coerce', utc=True)
+    df = df.dropna(subset=[ML_DATE_COL])
+    
+    print(f"Duplicates/Invalid Dates removed: {init_len - len(df)}")
+    
+    # 3.2 Feature Engineering
+    print("-> Creating features from text and dates...")
+    
+    # NLP / Regex Features
+    desc = df['description'].fillna("").astype(str)
     for col, pat in KEYWORD_PATTERNS.items():
         df[col] = desc.str.contains(pat, flags=re.IGNORECASE, regex=True).astype(int)
     
+    # Temporal Features
+    now = pd.Timestamp(datetime.now(timezone.utc))
+    df['age_days'] = (now - df[ML_DATE_COL]).dt.days
+    df['desc_len'] = desc.str.len()
+    
+    # CVSS Vector Parsing
     if 'cvss_vector' in df.columns:
         df['cvss_vector'] = df['cvss_vector'].fillna("")
         cvss_parsed = df['cvss_vector'].apply(parse_cvss_vector).apply(pd.Series)
         df = pd.concat([df, cvss_parsed], axis=1)
 
-    now = pd.Timestamp(datetime.now(timezone.utc))
-    df['age_days'] = (now - df[ML_DATE_COL]).dt.days
-    df['desc_len'] = desc.str.len()
-    
-    if 'has_patch_ref' not in df.columns:
-        df['has_patch_ref'] = 0
-    
     return df
 
-# ---------------------------------------------------------
-# 3. Machine Learning (Undersampling + LightGBM)
-# ---------------------------------------------------------
-
-def train_evaluate_model(df):
-    if df[ML_TARGET_COL].nunique() < 2:
-        print("Erreur : Une seule classe détectée.")
-        return None
-
-    # Split Temporel
-    limit_idx = int(len(df) * (1 - ML_TEST_SIZE))
-    train_df = df.iloc[:limit_idx]
-    test_df = df.iloc[limit_idx:]
+# =============================================================================
+# 4. DIMENSION REDUCTION (PCA)
+# =============================================================================
+def perform_pca_analysis(X_train_num):
+    print("\n" + "="*50)
+    print("STEP 4: DIMENSION REDUCTION (PCA)")
+    print("="*50)
     
-    print(f"Données Train Originales : {len(train_df)}")
+    # Standardize
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_train_num)
+    
+    # Apply PCA
+    pca = PCA(n_components=0.95)
+    X_pca = pca.fit_transform(X_scaled)
+    
+    print(f"Original Num Features: {X_train_num.shape[1]}")
+    print(f"Reduced Components (95% var): {X_pca.shape[1]}")
 
-    # Undersampling (Ratio 1:20)
+# =============================================================================
+# 5. MODELING (Creation, Tuning, Addressing Overfitting)
+# =============================================================================
+def build_and_train_models(df):
+    print("\n" + "="*50)
+    print("STEP 5: MODELING & TUNING")
+    print("="*50)
+    
+    # 5.1 Train-Test Split (Temporal)
+    df = df.sort_values(ML_DATE_COL)
+    limit = int(len(df) * (1 - ML_TEST_SIZE))
+    
+    train_df = df.iloc[:limit]
+    test_df = df.iloc[limit:]
+    
+    # 5.2 Addressing Class Imbalance (Undersampling)
+    print("-> Addressing Class Imbalance (Undersampling Strategy)...")
     kev_train = train_df[train_df[ML_TARGET_COL] == 1]
     safe_train = train_df[train_df[ML_TARGET_COL] == 0]
     
+    # Ratio 1:20
     if len(kev_train) > 0:
-        n_safe = len(kev_train) * 20
-        safe_train_sampled = safe_train.sample(n=n_safe, random_state=ML_SEED)
-        train_df_balanced = pd.concat([kev_train, safe_train_sampled]).sample(frac=1, random_state=ML_SEED)
+        safe_sample = safe_train.sample(n=len(kev_train)*20, random_state=ML_SEED)
+        train_balanced = pd.concat([kev_train, safe_sample]).sample(frac=1, random_state=ML_SEED)
     else:
-        print("Attention: Pas de KEV dans le set d'entraînement.")
-        train_df_balanced = train_df
+        print("! WARNING: No KEV in training set.")
+        train_balanced = train_df
+        
+    print(f"Train Set Size: {len(train_balanced)} (Balanced)")
+    print(f"Test Set Size: {len(test_df)} (Real World Distribution)")
 
-    print(f"Données Train Rééquilibrées : {len(train_df_balanced)} (dont {len(kev_train)} KEV)")
-    
+    # Prepare X, y
     cols_drop = [ML_TARGET_COL, 'cve_id', 'published_date', 'cvss_vector', 'published']
-    X_train = train_df_balanced.drop(columns=cols_drop, errors='ignore')
-    y_train = train_df_balanced[ML_TARGET_COL]
-    
+    X_train = train_balanced.drop(columns=cols_drop, errors='ignore')
+    y_train = train_balanced[ML_TARGET_COL]
     X_test = test_df.drop(columns=cols_drop, errors='ignore')
     y_test = test_df[ML_TARGET_COL]
-    
+
+    # Feature selection for Preprocessor
     avail_cols = X_train.columns.tolist()
     cat_cols = [c for c in CVSS_METRICS_KEYS if c in avail_cols]
     num_cols = ['cvss_score', 'age_days', 'desc_len', 'has_patch_ref'] + list(KEYWORD_PATTERNS.keys())
     num_cols = [c for c in num_cols if c in avail_cols]
-    
+
+    # Run PCA Analysis demo
+    perform_pca_analysis(X_train[num_cols].fillna(0))
+
+    # 5.3 Pipeline
     preprocessor = ColumnTransformer(
         transformers=[
-            ('txt', TfidfVectorizer(max_features=2000, stop_words='english'), 'description'),
-            ('num', Pipeline([('imputer', SimpleImputer(strategy='median')), ('scaler', StandardScaler())]), num_cols),
+            ('txt', TfidfVectorizer(max_features=1000, stop_words='english'), 'description'),
+            ('num', Pipeline([
+                ('imputer', SimpleImputer(strategy='median')), 
+                ('scaler', StandardScaler())
+            ]), num_cols),
             ('cat', OneHotEncoder(handle_unknown='ignore'), cat_cols)
         ]
     )
+
+    results = {}
     
-    if HAS_LIGHTGBM:
-        clf = LGBMClassifier(n_estimators=1000, learning_rate=0.05, scale_pos_weight=1.5, n_jobs=-1, random_state=ML_SEED, verbose=-1)
-    else:
-        clf = RandomForestClassifier(n_estimators=300, class_weight='balanced', n_jobs=-1, random_state=ML_SEED)
-        
-    pipeline = Pipeline([
+    # MODEL 1: Logistic Regression
+    print("\nTraining Model 1: Logistic Regression (Baseline)...")
+    pipe_lr = Pipeline([
         ('preprocessor', preprocessor),
-        ('classifier', clf)
+        ('clf', LogisticRegression(class_weight='balanced', max_iter=1000))
     ])
-    
-    print("Entraînement en cours...")
-    pipeline.fit(X_train, y_train)
-    
-    probs = pipeline.predict_proba(X_test)[:, 1]
-    preds = (probs >= 0.5).astype(int)
-    
-    print("\n--- RÉSULTATS (Test Set) ---")
-    print(f"ROC-AUC: {roc_auc_score(y_test, probs):.4f}")
-    print(f"Avg Precision: {average_precision_score(y_test, probs):.4f}")
-    print(classification_report(y_test, preds))
-    
-    return pipeline
+    pipe_lr.fit(X_train, y_train)
+    results['Logistic Regression'] = pipe_lr
 
-def generate_risk_report(pipeline, df):
-    if pipeline is None: return
+    # MODEL 2: Random Forest
+    print("Training Model 2: Random Forest (Ensemble)...")
+    pipe_rf = Pipeline([
+        ('preprocessor', preprocessor),
+        ('clf', RandomForestClassifier(n_estimators=200, max_depth=20, 
+                                       class_weight='balanced', random_state=ML_SEED, n_jobs=-1))
+    ])
+    pipe_rf.fit(X_train, y_train)
+    results['Random Forest'] = pipe_rf
 
-    print("\nPrédiction sur les CVE non-classées (Risk Scoring)...")
+    # MODEL 3: LightGBM
+    if HAS_LIGHTGBM:
+        print("Training Model 3: LightGBM (Gradient Boosting)...")
+        # Scale_pos_weight helps even with undersampling
+        pipe_lgbm = Pipeline([
+            ('preprocessor', preprocessor),
+            ('clf', LGBMClassifier(n_estimators=1000, learning_rate=0.05, 
+                                   num_leaves=31, scale_pos_weight=1.5, 
+                                   verbose=-1, random_state=ML_SEED))
+        ])
+        pipe_lgbm.fit(X_train, y_train)
+        results['LightGBM'] = pipe_lgbm
+
+    return results, X_test, y_test
+
+# =============================================================================
+# 6. MODEL COMPARISON & CONCLUSION
+# =============================================================================
+def compare_models(results, X_test, y_test):
+    print("\n" + "="*50)
+    print("STEP 6: MODEL COMPARISON")
+    print("="*50)
+    
+    summary = []
+    
+    for name, model in results.items():
+        probs = model.predict_proba(X_test)[:, 1]
+        preds = (probs >= 0.5).astype(int)
+        
+        auc = roc_auc_score(y_test, probs)
+        ap = average_precision_score(y_test, probs)
+        f1 = f1_score(y_test, preds)
+        
+        # Calculate Recall for Class 1 specifically
+        tn, fp, fn, tp = confusion_matrix(y_test, preds).ravel()
+        recall_pos = tp / (tp + fn) if (tp+fn) > 0 else 0
+        
+        summary.append({
+            'Model': name,
+            'ROC-AUC': auc,
+            'Avg Precision': ap,
+            'F1-Score': f1,
+            'Recall (Class 1)': recall_pos
+        })
+        
+    summary_df = pd.DataFrame(summary)
+    print(summary_df.sort_values(by='ROC-AUC', ascending=False))
+    
+    # Pick Best
+    best_model_name = summary_df.sort_values(by='ROC-AUC', ascending=False).iloc[0]['Model']
+    print(f"\nCONCLUSION: The best performing model is {best_model_name}.")
+    
+    return results[best_model_name]
+
+# =============================================================================
+# 7. BONUS: RISK SCORING REPORT
+# =============================================================================
+def generate_risk_report(model, df):
+    print("\n" + "="*50)
+    print("STEP 7: RISK SCORING REPORT (BONUS)")
+    print("="*50)
+    
+    # Predict on safe CVEs
     target_df = df[df[ML_TARGET_COL] == 0].copy()
+    if target_df.empty: return
     
-    if target_df.empty:
-        return
-
     cols_drop = [ML_TARGET_COL, 'cve_id', 'published_date', 'cvss_vector', 'published']
     X_target = target_df.drop(columns=cols_drop, errors='ignore')
     
-    target_df['risk_probability'] = pipeline.predict_proba(X_target)[:, 1]
+    probs = model.predict_proba(X_target)[:, 1]
+    target_df['risk_score'] = probs
     
-    q99 = target_df['risk_probability'].quantile(0.99)
-    q95 = target_df['risk_probability'].quantile(0.95)
+    # Tiering
+    q99 = np.quantile(probs, 0.99)
+    q95 = np.quantile(probs, 0.95)
     
     def get_tier(p):
         if p >= q99: return "CRITICAL"
         if p >= q95: return "HIGH"
         return "MEDIUM/LOW"
+        
+    target_df['risk_tier'] = target_df['risk_score'].apply(get_tier)
     
-    target_df['risk_tier'] = target_df['risk_probability'].apply(get_tier)
+    # Export
+    output_cols = ['cve_id', 'risk_score', 'risk_tier', 'cvss_score', 'description']
+    report = target_df[output_cols].sort_values('risk_score', ascending=False).head(50)
+    report.to_csv("final_risk_report.csv", index=False)
     
-    out_cols = ['cve_id', 'risk_probability', 'risk_tier', 'cvss_score', 'description']
-    final_df = target_df[out_cols].sort_values('risk_probability', ascending=False)
-    
-    final_df.to_csv("predicted_risk_report.csv", index=False)
-    print("Rapport 'predicted_risk_report.csv' généré avec succès.")
-    print("Top 3 CVE détectées à haut risque :")
-    print(final_df[['cve_id', 'risk_probability', 'description']].head(3))
+    print("Top 5 Detected Risks:")
+    print(report.head(5))
+    print("\nFile 'final_risk_report.csv' saved successfully.")
 
-# ---------------------------------------------------------
-# Main Execution
-# ---------------------------------------------------------
+# =============================================================================
+# MAIN EXECUTION
+# =============================================================================
 if __name__ == "__main__":
-    df_raw = build_dataset()
-    df_ml = feature_engineering(df_raw)
-    model = train_evaluate_model(df_ml)
-    generate_risk_report(model, df_ml)
+    # 1. Loading (Force Web)
+    df = load_data_from_web_only()
+    
+    # 2. EDA
+    analyze_dataset(df)
+    
+    # 3. Preprocessing
+    df_clean = preprocess_data(df)
+    
+    # 4, 5, 6. Modeling Pipeline
+    models, X_test, y_test = build_and_train_models(df_clean)
+    best_model = compare_models(models, X_test, y_test)
+    
+    # 7. Production
+    generate_risk_report(best_model, df_clean)
