@@ -43,7 +43,7 @@ except ImportError:
 
 warnings.filterwarnings('ignore')
 
-# 0. STRATEGIC CONFIGURATION [cite: 164-165]
+# 0. STRATEGIC CONFIGURATION 
 
 class CFG:
     use_lightgbm_if_available = True
@@ -97,7 +97,7 @@ def load_data_from_web_only():
                             d = metrics['cvssMetricV2'][0]['cvssData']
                             score, vector = d.get('baseScore'), d.get('vectorString')
                         
-                        # Extracting REAL English Description [cite: 124-127]
+                        # Extracting REAL English Description 
                         desc = next((d['value'] for d in cve.get('descriptions', []) if d['lang'] == 'en'), "")
                         
                         all_data.append({
@@ -114,27 +114,27 @@ def load_data_from_web_only():
         raise ValueError("CRITICAL: No data could be downloaded.")
         
     df = pd.DataFrame(all_data)
-    # Mapping the target label (KEV vs Non-KEV) [cite: 49, 110]
+    # Mapping the target label (KEV vs Non-KEV) 
     df[CFG.ml_target_col] = df['cve_id'].apply(lambda x: 1 if x in kev_set else 0)
     print(f"    * Consolidated dataset contains {len(df)} records.")
     return df
 
-# 2. DATA PRE-PROCESSING [cite: 122]
+# 2. DATA PRE-PROCESSING 
 
 def preprocess_data(df):
     print("\n[STEP 2] PRE-PROCESSING & FEATURE ENGINEERING")
     
-    # Cleaning duplicates [cite: 88]
+    # Cleaning duplicates 
     df = df.copy().drop_duplicates(subset=['cve_id'])
     
-    # Temporal Information [cite: 128]
+    # Temporal Information 
     df[CFG.ml_date_col] = pd.to_datetime(df[CFG.ml_date_col], errors='coerce', utc=True)
     df = df.dropna(subset=[CFG.ml_date_col])
     now = pd.Timestamp.now(tz='UTC')
     df['age_days'] = (now - df[CFG.ml_date_col]).dt.days
     df['desc_len'] = df['description'].fillna("").str.len()
     
-    # CVSS Vector Parsing [cite: 133-137]
+    # CVSS Vector Parsing
     def parse_vector(v):
         out = {m: "MISSING" for m in CVSS_METRICS_KEYS}
         if isinstance(v, str):
@@ -149,7 +149,7 @@ def preprocess_data(df):
     
     return df
 
-# 3. MODELLING STRATEGY & IMPLEMENTATION [cite: 148]
+# 3. MODELLING STRATEGY & IMPLEMENTATION
 
 def build_model():
     """Implements the decision logic to pivot to LightGBM[cite: 156, 161]."""
@@ -161,7 +161,7 @@ def build_model():
             num_leaves=31,
             random_state=CFG.ml_seed,
             verbose=-1,
-            scale_pos_weight=10 # Handling severe imbalance [cite: 120]
+            scale_pos_weight=10 # Handling severe imbalance 
         )
     else:
         print("-> Fallback to Logistic Regression")
@@ -173,7 +173,7 @@ def train_production_model(df):
     num_cols = ['cvss_score', 'age_days', 'desc_len']
     cat_cols = CVSS_METRICS_KEYS
     
-    # Pipeline construction [cite: 144-146]
+    # Pipeline construction 
     num_pipe = Pipeline([
         ('imputer', SimpleImputer(strategy='median')),
         ('scaler', StandardScaler()),
@@ -186,7 +186,7 @@ def train_production_model(df):
         ('cat', OneHotEncoder(handle_unknown='ignore'), cat_cols)
     ])
 
-    # Temporal Split [cite: 90-94]
+    # Temporal Split 
     df = df.sort_values(CFG.ml_date_col)
     limit = int(len(df) * (1 - CFG.ml_test_size))
     train_df, test_df = df.iloc[:limit], df.iloc[limit:]
@@ -199,24 +199,24 @@ def train_production_model(df):
         ('clf', build_model())
     ])
 
-    # Extended Training on the Full Dataset [cite: 170-172]
+    # Extended Training on the Full Dataset 
     model_pipeline.fit(X_train, y_train)
     
     return model_pipeline
 
-# 4. STRATEGIC INTERPRETATION & RESULTS [cite: 179]
+# 4. STRATEGIC INTERPRETATION & RESULTS 
 
 def generate_risk_stratification(model, df):
     print("\n[STEP 4] RISK-BASED STRATIFICATION [cite: 207]")
     
-    # Focusing on currently unexploited CVEs (Non-KEV) [cite: 55-62]
+    # Focusing on currently unexploited CVEs (Non-KEV) 
     non_kev = df[df[CFG.ml_target_col] == 0].copy()
     X_target = non_kev.drop(columns=[CFG.ml_target_col, 'cve_id', 'published_date', 'cvss_vector'])
     
     probs = model.predict_proba(X_target)[:, 1]
     non_kev['risk_score'] = probs
     
-    # 4-Tier Quantile Stratification [cite: 214-218]
+    # 4-Tier Quantile Stratification 
     q99, q95, q80 = np.quantile(probs, [0.99, 0.95, 0.80])
     
     def get_tier(p):
