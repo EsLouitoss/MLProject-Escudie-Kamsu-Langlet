@@ -152,7 +152,7 @@ def preprocess_data(df):
 # 3. MODELLING STRATEGY & IMPLEMENTATION
 
 def build_model():
-    """Implements the decision logic to pivot to LightGBM[cite: 156, 161]."""
+    """Implements the decision logic to pivot to LightGBM."""
     if CFG.use_lightgbm_if_available and HAS_LIGHTGBM:
         print("-> Selecting LightGBM (Gradient Boosting)")
         return LGBMClassifier(
