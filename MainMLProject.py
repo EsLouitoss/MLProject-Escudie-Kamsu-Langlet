@@ -207,7 +207,7 @@ def train_production_model(df):
 # 4. STRATEGIC INTERPRETATION & RESULTS 
 
 def generate_risk_stratification(model, df):
-    print("\n[STEP 4] RISK-BASED STRATIFICATION [cite: 207]")
+    print("\n[STEP 4] RISK-BASED STRATIFICATION")
     
     # Focusing on currently unexploited CVEs (Non-KEV) 
     non_kev = df[df[CFG.ml_target_col] == 0].copy()
@@ -231,7 +231,7 @@ def generate_risk_stratification(model, df):
     output_cols = ['cve_id', 'risk_score', 'risk_tier', 'cvss_score', 'description']
     non_kev[output_cols].to_csv("non_kve_predicted_probs.csv", index=False)
     
-    print("Risk Tier Distribution Summary[cite: 231]:")
+    print("Risk Tier Distribution Summary :")
     print(non_kev['risk_tier'].value_counts().sort_index(ascending=False))
 
 if __name__ == "__main__":
